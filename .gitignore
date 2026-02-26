@@ -1,0 +1,35 @@
+# 환경변수 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+
+# Python 가상환경
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 데이터 파일 (대용량)
+data/raw/
+data/processed/
+data/checkpoints/
+
+# 모델 파일
+models/trained/
+
+# 로그
+logs/*.log
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

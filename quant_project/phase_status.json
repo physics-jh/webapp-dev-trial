@@ -1,0 +1,13 @@
+{
+  "phases": {
+    "P0_setup":        { "status": "completed", "completed_at": "2026-02-25" },
+    "P1_data":         { "status": "completed", "completed_at": "2026-02-25" },
+    "P2_factor":       { "status": "completed", "completed_at": "2026-02-26", "features": 10, "rows": 1306183 },
+    "P3_backend_base": { "status": "completed", "completed_at": "2026-02-26", "endpoints": 16 },
+    "P4_ml":           { "status": "in_progress" },
+    "P5_backtest":     { "status": "pending" },
+    "P6_backend":      { "status": "pending" },
+    "P7_frontend":     { "status": "pending" },
+    "P8_integration":  { "status": "pending" }
+  }
+}
