@@ -1,0 +1,25 @@
+[
+  {
+    "version": "v1_20260226_1358",
+    "features": [
+      "disparity_20",
+      "mom_gap",
+      "ret_1m",
+      "rsi",
+      "ma_cross",
+      "vol_zscore",
+      "mfi",
+      "dol_vol",
+      "downside_vol",
+      "natr"
+    ],
+    "ensemble": [
+      "lightgbm",
+      "ridge"
+    ],
+    "split_strategy": "TimeSeriesSplit(max_train_size=756, test_size=126, gap=0)",
+    "wf_steps": 9,
+    "avg_ensemble_ic": 0.02237423210245168,
+    "trained_at": "2026-02-26T13:58:51.064949"
+  }
+]

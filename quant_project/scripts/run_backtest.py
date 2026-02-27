@@ -35,9 +35,14 @@ OUT_DIR     = BASE_DIR / "data" / "processed"
 SLIPPAGE    = 0.001   # 슬리피지 0.1%
 COMMISSION  = 0.0005  # 수수료 0.05%
 
-# ─── 레짐 필터 임계값 ───────────────────────────────────────
-VIX_THRESHOLD    = 25.0   # VIX > 25: 포지션 50% 축소
-T10Y2Y_THRESHOLD = 0.0    # 장단기금리차 < 0: 추가 25% 축소
+# ─── 레짐 필터 임계값 (mdd-improvement v2 — 균형 조정) ──────────
+# VIX > 20이 28% 빈도 → 과포지션 축소 문제 → VIX 기준 25 복원
+# SPY 200MA는 추가 조건으로 온건하게 적용 (×0.80)
+VIX_BEAR_THRESHOLD    = 25.0   # VIX > 25: bear 공포 구간 (기존 유지)
+VIX_EXTREME_THRESHOLD = 32.0   # VIX > 32: 극단적 공포 (추가 축소)
+T10Y2Y_THRESHOLD      = 0.0    # 장단기금리차 < 0: 추가 축소
+STOP_LOSS_1M          = -0.10  # 개별 손절: 1개월 수익률 < -10%
+SPY_MA_WINDOW         = 200    # SPY 200일 이평 윈도우
 
 
 # ─── 1. 모델·데이터 로드 ─────────────────────────────────────
@@ -101,23 +106,69 @@ def generate_signals(
     return scores
 
 
+def generate_rule_scores(factors: pd.DataFrame) -> pd.DataFrame:
+    """룰베이스 신호 생성 — 모멘텀 + 저변동성 혼합 팩터
+    rule_score = 0.5×ret_3m + 0.3×ret_1m + 0.2×(1/vol_20) (정규화)
+    기술적 팩터만 사용하므로 factors.parquet로 즉시 계산 가능.
+    """
+    logger.info("룰베이스 신호 생성 중...")
+    f = factors.copy()
+
+    # 사용 가능한 컬럼만 활용 (존재하지 않으면 0)
+    ret3m = f["ret_3m"] if "ret_3m" in f.columns else pd.Series(0.0, index=f.index)
+    ret1m = f["ret_1m"] if "ret_1m" in f.columns else pd.Series(0.0, index=f.index)
+    vol20 = f["vol_20"].clip(lower=1e-4) if "vol_20" in f.columns else pd.Series(0.2, index=f.index)
+
+    raw = 0.5 * ret3m + 0.3 * ret1m + 0.2 * (1.0 / vol20)
+    f["rule_score"] = raw
+
+    rule_scores = f["rule_score"].unstack(level="ticker")
+    logger.info(f"룰베이스 신호 피벗: {rule_scores.shape}")
+    return rule_scores
+
+
 # ─── 3. 레짐 필터 ────────────────────────────────────────────
 
-def get_regime_multiplier(macro: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Series:
-    """날짜별 포지션 크기 배수 (레짐 기반)"""
+def get_regime_multiplier(
+    macro: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    close: pd.DataFrame | None = None,
+) -> pd.Series:
+    """날짜별 포지션 크기 배수 (3단계 레짐 — mdd-improvement)
+
+    1단계: VIX > 20 or SPY < 200MA → 1/3 축소 (0.333)
+    2단계: T10Y2Y < 0               → 추가 25% 축소 (*0.75)
+    3단계: VIX > 25                 → 현금 30% 확보 (*0.70)
+    """
     macro_aligned = macro.reindex(dates, method="ffill")
     mult = pd.Series(1.0, index=dates)
 
-    vix = macro_aligned.get("VIXCLS")
-    t10y2y = macro_aligned.get("T10Y2Y")
+    vix    = macro_aligned["VIXCLS"]    if "VIXCLS" in macro_aligned.columns else None
+    t10y2y = macro_aligned["T10Y2Y"]   if "T10Y2Y" in macro_aligned.columns else None
 
+    # SPY 200일 이평 조건
+    spy_below_ma200 = pd.Series(False, index=dates)
+    if close is not None and "SPY" in close.columns:
+        spy = close["SPY"].reindex(dates, method="ffill")
+        ma200 = spy.rolling(SPY_MA_WINDOW, min_periods=100).mean()
+        spy_below_ma200 = spy < ma200
+
+    # 1단계: SPY < 200MA → 20% 축소 (온건한 추가 방어)
+    mult[spy_below_ma200] *= 0.80
+
+    # 2단계: VIX > 25 → 50% 축소 (공포 구간 기존 수준 유지)
     if vix is not None:
-        mult[vix > VIX_THRESHOLD] *= 0.5       # 공포 구간: 50% 축소
+        mult[vix > VIX_BEAR_THRESHOLD] *= 0.50
 
+    # 3단계: T10Y2Y < 0 → 추가 15% 축소 (완화: 기존 25% → 15%)
     if t10y2y is not None:
-        mult[t10y2y < T10Y2Y_THRESHOLD] *= 0.75  # 금리역전: 추가 25% 축소
+        mult[t10y2y < T10Y2Y_THRESHOLD] *= 0.85
 
-    return mult
+    # 4단계: VIX > 32 → 극단적 공포, 추가 30% 축소 (코로나 같은 구간)
+    if vix is not None:
+        mult[vix > VIX_EXTREME_THRESHOLD] *= 0.70
+
+    return mult.clip(upper=1.0)
 
 
 # ─── 4. 포지션 크기: 변동성 역가중 ───────────────────────────
@@ -143,37 +194,58 @@ def run_single_backtest(
     macro: pd.DataFrame,
     ml_weight: float,
     top_n: int,
-    start: str = "2017-01-01",   # WF 학습 시작 이후만 사용
+    rule_scores: pd.DataFrame | None = None,
+    rule_weight: float = 0.0,
+    start: str = "2017-01-01",
+    spy_ret: pd.Series | None = None,
 ) -> dict:
     """
-    단일 파라미터 조합 백테스트.
-    월별 리밸런싱 → 변동성 역가중 포지션 → 레짐 조정.
+    단일 파라미터 조합 백테스트 (mdd-improvement).
+    월별 리밸런싱 → 변동성 역가중 → 레짐 조정 → 손절 필터.
+    rule_scores / rule_weight 추가: ML + 룰베이스 혼합 점수 지원.
     """
-    # 공통 날짜 (월말 리밸런싱)
     dates = scores.index[scores.index >= start]
-    # 월이 바뀌는 첫 거래일을 리밸런싱 날짜로 사용 (shift 대신 period 비교)
     months = pd.PeriodIndex(dates, freq="M")
     rebal_mask  = np.concatenate([[True], months[1:] != months[:-1]])
     rebal_dates = set(dates[rebal_mask])
 
-    tickers_all = scores.columns.tolist()
+    tickers_all  = scores.columns.tolist()
     close_common = close.reindex(columns=tickers_all).reindex(dates).ffill()
-    regime_mult  = get_regime_multiplier(macro, dates)
+    # SPY 포함 close 전달 (200MA 계산)
+    regime_mult  = get_regime_multiplier(macro, dates, close=close)
 
-    # 포트폴리오 수익률 누적 계산
-    portfolio_value = 1.0
-    prev_weights    = pd.Series(0.0, index=tickers_all)
-    daily_returns   = []
+    # ── 혼합 점수 계산 (퍼센타일 랭킹 후 가중합) ──────────────────
+    total_w = ml_weight + (rule_weight if rule_scores is not None else 0.0)
+    if rule_scores is not None and rule_weight > 0.0 and total_w > 0:
+        ml_ranks   = scores.rank(axis=1, pct=True)
+        rule_ranks = rule_scores.reindex(index=scores.index, columns=scores.columns).rank(axis=1, pct=True)
+        combined   = (ml_weight * ml_ranks + rule_weight * rule_ranks) / total_w
+    else:
+        combined = scores  # 순수 ML 모드
+
+    prev_weights  = pd.Series(0.0, index=tickers_all)
+    daily_returns = []
 
     for i, date in enumerate(dates):
-        # 리밸런싱 날짜: 포지션 재구성
         if date in rebal_dates:
-            day_scores = scores.loc[date].dropna()
+            day_scores = combined.loc[date].dropna() if date in combined.index else scores.loc[date].dropna()
             if len(day_scores) < top_n:
                 weights = prev_weights
             else:
-                # 상위 top_n 선택 (ml_weight 높을수록 ML 점수 비중↑)
-                ranked = day_scores.nlargest(top_n).index.tolist()
+                # 손절 필터: 1개월 수익률 < -10% 종목 후보에서 제외
+                if i >= 22:
+                    prev22_date = dates[max(i - 22, 0)]
+                    ret_1m = (close_common.loc[date] / close_common.loc[prev22_date] - 1).fillna(0)
+                    valid_scores = day_scores[
+                        day_scores.index.map(lambda t: ret_1m.get(t, 0) >= STOP_LOSS_1M)
+                    ]
+                    if len(valid_scores) < 3:
+                        valid_scores = day_scores  # 손절 후 종목 너무 적으면 무시
+                else:
+                    valid_scores = day_scores
+
+                # 상위 top_n 선택
+                ranked = valid_scores.nlargest(top_n).index.tolist()
 
                 # 변동성 역가중
                 try:
@@ -203,11 +275,11 @@ def run_single_backtest(
         daily_returns.append({"date": date, "return": port_ret})
 
     ret_series = pd.DataFrame(daily_returns).set_index("date")["return"]
-    return _calc_metrics(ret_series)
+    return _calc_metrics(ret_series, spy_ret=spy_ret)
 
 
-def _calc_metrics(ret: pd.Series) -> dict:
-    """수익률 시계열 → 성과 지표 계산"""
+def _calc_metrics(ret: pd.Series, spy_ret: pd.Series | None = None) -> dict:
+    """수익률 시계열 → 성과 지표 계산. spy_ret 제공 시 벤치마크 곡선 포함."""
     cum   = (1 + ret).cumprod()
     total = float(cum.iloc[-1] - 1)
     n_years = len(ret) / 252
@@ -217,7 +289,7 @@ def _calc_metrics(ret: pd.Series) -> dict:
     mdd   = float(((cum - roll_max) / roll_max).min())
     win   = float((ret > 0).mean())
 
-    return {
+    result = {
         "total_return": round(total, 4),
         "cagr":         round(cagr, 4),
         "sharpe":       round(sharpe, 4),
@@ -227,34 +299,68 @@ def _calc_metrics(ret: pd.Series) -> dict:
         "end_date":     str(ret.index[-1].date()),
         "equity_curve": (1 + ret).cumprod().round(6).to_dict(),
     }
+    if spy_ret is not None:
+        spy_aligned = spy_ret.reindex(ret.index).fillna(0)
+        result["spy_curve"] = (1 + spy_aligned).cumprod().round(6).to_dict()
+    return result
 
 
 # ─── 6. 파라미터 스윕 ────────────────────────────────────────
 
 def param_sweep(
     scores, close, factors, macro,
+    rule_scores=None,
     ml_weights=None,
-    top_ns=None,
+    rule_weights=None,
+    top_n: int = 10,
 ) -> list[dict]:
-    """ml_weight × top_n 그리드 탐색 → Sharpe Contour 데이터"""
-    ml_weights = ml_weights or [0.3, 0.4, 0.5, 0.6, 0.7]
-    top_ns     = top_ns     or [5, 10, 15, 20]
+    """ml_weight × rule_weight 2D 그리드 탐색 → 3D Sharpe Surface 데이터
+    rule_scores 없으면 기존 ml_weight × top_n 1D 스윕으로 폴백.
+    """
+    if rule_scores is not None:
+        # 신규: 2D 스윕 (ml_weight × rule_weight), top_n 고정
+        ml_weights   = ml_weights   or [0.1, 0.3, 0.5, 0.7, 0.9]
+        rule_weights = rule_weights or [0.1, 0.3, 0.5, 0.7, 0.9]
+        total = len(ml_weights) * len(rule_weights)
+        logger.info(f"2D 파라미터 스윕: {total}개 조합 (ml_weight × rule_weight, top_n={top_n})")
 
-    results = []
-    total   = len(ml_weights) * len(top_ns)
-    logger.info(f"파라미터 스윕: {total}개 조합")
+        results = []
+        for ml_w in ml_weights:
+            for rb_w in rule_weights:
+                logger.info(f"  [{len(results)+1}/{total}] ml_w={ml_w}, rb_w={rb_w}")
+                metrics = run_single_backtest(
+                    scores, close, factors, macro,
+                    ml_weight=ml_w, top_n=top_n,
+                    rule_scores=rule_scores, rule_weight=rb_w,
+                )
+                results.append({
+                    "ml_weight":   ml_w,
+                    "rule_weight": rb_w,
+                    "top_n":       top_n,
+                    "sharpe":      metrics["sharpe"],
+                    "cagr":        metrics["cagr"],
+                    "mdd":         metrics["max_drawdown"],
+                })
+    else:
+        # 레거시 폴백: ml_weight × top_n 스윕
+        ml_weights = ml_weights or [0.3, 0.4, 0.5, 0.6, 0.7]
+        top_ns     = [5, 10, 15, 20]
+        total = len(ml_weights) * len(top_ns)
+        logger.info(f"1D 파라미터 스윕 (레거시): {total}개 조합")
 
-    for i, ml_w in enumerate(ml_weights):
-        for top_n in top_ns:
-            logger.info(f"  [{len(results)+1}/{total}] ml_weight={ml_w}, top_n={top_n}")
-            metrics = run_single_backtest(scores, close, factors, macro, ml_w, top_n)
-            results.append({
-                "ml_weight": ml_w,
-                "top_n":     top_n,
-                "sharpe":    metrics["sharpe"],
-                "cagr":      metrics["cagr"],
-                "mdd":       metrics["max_drawdown"],
-            })
+        results = []
+        for ml_w in ml_weights:
+            for tn in top_ns:
+                logger.info(f"  [{len(results)+1}/{total}] ml_weight={ml_w}, top_n={tn}")
+                metrics = run_single_backtest(scores, close, factors, macro, ml_w, tn)
+                results.append({
+                    "ml_weight":   ml_w,
+                    "rule_weight": 0.0,
+                    "top_n":       tn,
+                    "sharpe":      metrics["sharpe"],
+                    "cagr":        metrics["cagr"],
+                    "mdd":         metrics["max_drawdown"],
+                })
 
     return results
 
@@ -266,49 +372,87 @@ def main():
     factors, close, macro = load_data()
     features = meta["features"]
 
-    # ML 신호
-    scores = generate_signals(factors, models, scaler, features)
+    # ML 신호 + 룰베이스 신호
+    scores      = generate_signals(factors, models, scaler, features)
+    rule_scores = generate_rule_scores(factors)
 
-    # 기본 파라미터로 전체 백테스트
-    logger.info("기본 백테스트 실행 (ml_weight=0.5, top_n=10)...")
-    base_metrics = run_single_backtest(scores, close, factors, macro,
-                                       ml_weight=0.5, top_n=10)
+    # SPY 일별 수익률 (벤치마크용)
+    spy_ret = None
+    if "SPY" in close.columns:
+        spy_ret = close["SPY"].pct_change().fillna(0)
+        logger.info("SPY 벤치마크 수익률 준비 완료")
 
-    # 수익률 곡선 별도 저장
-    eq_curve = pd.Series(base_metrics.pop("equity_curve"))
+    # ── baseline 저장 (기존 결과 보존) ───────────────────────────
+    baseline_path = BASE_DIR / "models" / "results" / "baseline_summary.json"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_summary = OUT_DIR / "backtest_summary.json"
+    if existing_summary.exists() and not baseline_path.exists():
+        import shutil
+        shutil.copy(existing_summary, baseline_path)
+        logger.info(f"baseline_summary.json 저장: {baseline_path}")
+
+    # ── 개선된 파라미터로 백테스트 ─────────────────────────────
+    logger.info("개선된 백테스트 실행 (mdd-improvement v2: SPY 200MA + 손절 + 룰베이스 혼합)...")
+    base_metrics = run_single_backtest(
+        scores, close, factors, macro,
+        ml_weight=0.5, top_n=10,
+        rule_scores=rule_scores, rule_weight=0.3,
+        spy_ret=spy_ret,
+    )
+
+    # 수익률 곡선 저장 (전략 + SPY 벤치마크)
+    eq_dict  = base_metrics.pop("equity_curve")
+    spy_dict = base_metrics.pop("spy_curve", {})
+    eq_curve = pd.Series(eq_dict, name="equity")
     eq_curve.index = pd.to_datetime(eq_curve.index)
-    storage = get_storage()
-    storage.save(eq_curve.rename("equity").to_frame(), "equity_curve")
 
-    # backtest_summary.json
+    storage = get_storage()
+    if spy_dict:
+        spy_curve = pd.Series(spy_dict, name="spy")
+        spy_curve.index = pd.to_datetime(spy_curve.index)
+        eq_df = pd.concat([eq_curve, spy_curve], axis=1).sort_index()
+    else:
+        eq_df = eq_curve.to_frame()
+    storage.save(eq_df, "equity_curve")
+    logger.info(f"equity_curve 저장: {eq_df.shape} (컬럼: {eq_df.columns.tolist()})")
+
+    # backtest_summary.json 갱신
     summary_path = OUT_DIR / "backtest_summary.json"
     with open(summary_path, "w") as f:
         json.dump(base_metrics, f, indent=2)
-    logger.info(f"backtest_summary.json 저장: {base_metrics}")
+    logger.info(f"backtest_summary.json 갱신: {base_metrics}")
 
-    # 파라미터 스윕 → Sharpe Contour
-    logger.info("파라미터 스윕 시작...")
-    sweep = param_sweep(scores, close, factors, macro)
+    # ── 2D 파라미터 스윕 (ml_weight × rule_weight) ───────────────
+    logger.info("2D 파라미터 스윕 시작 (ml_weight × rule_weight, 25 조합)...")
+    sweep = param_sweep(scores, close, factors, macro, rule_scores=rule_scores, top_n=10)
     contour_path = OUT_DIR / "sharpe_contour.json"
     with open(contour_path, "w") as f:
         json.dump(sweep, f, indent=2)
     logger.info(f"sharpe_contour.json 저장 ({len(sweep)}개 조합)")
 
-    # 최적 파라미터 출력
+    # ── 개선 전후 비교 출력 ───────────────────────────────────────
     best = max(sweep, key=lambda x: x["sharpe"])
 
-    print(f"\n{'='*55}")
-    print(f"✅ P5 백테스트 완료")
-    print(f"   기본 전략 (top10, ml=0.5)")
-    print(f"     CAGR       : {base_metrics['cagr']*100:.1f}%")
-    print(f"     Sharpe     : {base_metrics['sharpe']:.3f}")
-    print(f"     MDD        : {base_metrics['max_drawdown']*100:.1f}%")
-    print(f"     Win Rate   : {base_metrics['win_rate']*100:.1f}%")
-    print(f"   최적 파라미터 (Sharpe 기준)")
-    print(f"     ml_weight  : {best['ml_weight']}")
-    print(f"     top_n      : {best['top_n']}")
-    print(f"     Sharpe     : {best['sharpe']:.3f}")
-    print(f"{'='*55}")
+    baseline = {}
+    if baseline_path.exists():
+        with open(baseline_path) as f:
+            baseline = json.load(f)
+
+    print(f"\n{'='*60}")
+    print(f"✅ mdd-improvement 백테스트 완료")
+    print(f"{'─'*60}")
+    print(f"  {'지표':<12} {'기존 (baseline)':>18} {'개선 후':>18}")
+    print(f"{'─'*60}")
+    for key, label in [("cagr", "CAGR"), ("sharpe", "Sharpe"), ("max_drawdown", "MDD"), ("win_rate", "Win Rate")]:
+        old = baseline.get(key)
+        new = base_metrics.get(key)
+        old_str = f"{old*100:.1f}%" if old is not None and key in ("cagr","max_drawdown","win_rate") else (f"{old:.3f}" if old else "N/A")
+        new_str = f"{new*100:.1f}%" if new is not None and key in ("cagr","max_drawdown","win_rate") else (f"{new:.3f}" if new else "N/A")
+        mdd_ok = "✅" if key == "max_drawdown" and new is not None and new >= -0.30 else ("⚠️" if key == "max_drawdown" else "")
+        print(f"  {label:<12} {old_str:>18} {new_str:>18} {mdd_ok}")
+    print(f"{'─'*60}")
+    print(f"  최적 파라미터: ml_weight={best['ml_weight']}, top_n={best['top_n']}, Sharpe={best['sharpe']:.3f}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

@@ -6,8 +6,19 @@
     "P3_backend_base": { "status": "completed", "completed_at": "2026-02-26", "endpoints": 16 },
     "P4_ml":           { "status": "completed", "completed_at": "2026-02-26", "avg_ic": 0.0224, "ensemble": ["lightgbm", "ridge"] },
     "P5_backtest":     { "status": "completed", "completed_at": "2026-02-26", "cagr": 0.2003, "sharpe": 0.7955, "mdd": -0.3273 },
-    "P6_backend":      { "status": "in_progress" },
-    "P7_frontend":     { "status": "pending" },
-    "P8_integration":  { "status": "pending" }
+    "P6_backend":      { "status": "completed", "completed_at": "2026-02-27",
+      "notes": "PRD v4.0 — AnalysisPlugin 추상 레이어, /api/analysis/{ticker}, RSS+VADER+Reddit, APScheduler 18:00~18:30" },
+    "P7_frontend":     { "status": "completed", "completed_at": "2026-02-27",
+      "notes": "5페이지: 펀더멘털필터, 백테스트, 포트폴리오모니터, 감성분석, 종목정성리포트(신규)" },
+    "P8_integration":  { "status": "completed", "completed_at": "2026-02-27",
+      "results": {
+        "look_ahead_bias": "PASS — 5/5 WF split OK",
+        "sharpe_contour_peak": "PASS — peak_ratio=1.28 (넓은 plateau)",
+        "mdd_check": "WARNING — MDD -32.7% > -30% (레짐 필터 강화 권장)",
+        "api_smoke_test": "PASS — 17개 엔드포인트 정상",
+        "analysis_aapl": "PASS — FreePlugin AAPL 원페이저 정상",
+        "sentiment_feed": "PASS — RSS 50건 수집"
+      }
+    }
   }
 }

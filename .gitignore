@@ -33,3 +33,7 @@ logs/*.log
 # OS
 .DS_Store
 Thumbs.db
+
+# AI 도구 (에이전트 상태/메모리)
+.claude/
+.bkit/
